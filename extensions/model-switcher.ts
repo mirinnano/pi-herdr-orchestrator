@@ -98,9 +98,13 @@ export default function modelSwitcher(pi: ExtensionAPI): void {
       if (active?.provider === selected.provider && active.id === selected.id) {
         return modelToolResult(JSON.stringify({ result: "already active", current: publicModel(active) }));
       }
-      const changed = await pi.setModel(selected);
-      if (!changed) return modelToolResult(`Could not switch to ${selected.provider}/${selected.id}: provider authentication is unavailable.`, true);
-      return modelToolResult(JSON.stringify({ result: "switched for this session", current: publicModel(selected) }));
+      try {
+        const changed = await pi.setModel(selected);
+        if (!changed) return modelToolResult(`Could not switch to ${selected.provider}/${selected.id}: provider authentication is unavailable.`, true);
+        return modelToolResult(JSON.stringify({ result: "switched for this session", current: publicModel(selected) }));
+      } catch {
+        return modelToolResult(`Switch to ${selected.provider}/${selected.id} failed; no retry was attempted. Check provider authentication and retry only after confirming the active model.`, true);
+      }
     },
   });
 
@@ -185,8 +189,8 @@ export default function modelSwitcher(pi: ExtensionAPI): void {
       try {
         if (await pi.setModel(model)) ctx.ui.notify(`Model: ${model.provider}/${model.id} (this session)`, "info");
         else ctx.ui.notify(`Cannot switch to ${model.provider}/${model.id}: authentication unavailable. Try /login.`, "warning");
-      } catch (error) {
-        ctx.ui.notify(`Model switch failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      } catch {
+        ctx.ui.notify("Model switch failed; no retry was attempted. Check provider authentication and confirm the active model before retrying.", "error");
       }
     },
   });

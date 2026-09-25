@@ -94,6 +94,21 @@ test("model tool reports the active model and only available exact choices", asy
   assert.equal(selected.length, 1);
 });
 
+test("model tool handles rejected switch promises without leaking provider diagnostics", async () => {
+  const a = model("openai", "gpt-a");
+  const b = model("anthropic", "claude-b");
+  const state = setup({
+    available: [a, b], current: a,
+    setModel: async () => { throw new Error("Bearer secret /Users/private/provider.json"); },
+  });
+  const result = await state.tools.get("select_model").execute("switch", {
+    action: "switch", provider: "anthropic", model_id: "claude-b",
+  }, undefined, undefined, state.ctx);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /no retry was attempted/);
+  assert.doesNotMatch(result.content[0].text, /secret|private|provider.json/);
+});
+
 test("records recent model changes and does not open custom UI in RPC", async () => {
   const a = model("openai", "gpt-a");
   const state = setup({ mode: "rpc", available: [a] });

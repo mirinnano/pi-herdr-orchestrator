@@ -1,6 +1,6 @@
 {
   "name": "pi-herdr-orchestrator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A scoped Pi Extension for coordinating recognized agents in Herdr-managed panes.",
   "keywords": ["pi-package", "pi-extension", "herdr", "agent-orchestration"],
   "type": "module",

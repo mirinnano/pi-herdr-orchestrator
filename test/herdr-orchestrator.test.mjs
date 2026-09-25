@@ -74,7 +74,7 @@ function snapshotWithWorkers(firstStatus = "idle", secondStatus = "done") {
   value.snapshot.panes[0].agent_status = firstStatus;
   value.snapshot.agents[1] = {
     name: "tester", agent: "pi", pane_id: "w1:p2", workspace_id: "w1", tab_id: "w1:t1",
-    focused: false, agent_status: secondStatus,
+    focused: false, agent_status: secondStatus, tokens: { pi_supervisor: "w1:p1" },
   };
   value.snapshot.panes[1].agent = "pi";
   value.snapshot.panes[1].agent_status = secondStatus;
@@ -84,6 +84,20 @@ function snapshotWithStartedWorker() {
   const value = snapshotWithWorkers("working", "idle");
   value.snapshot.agents[1].name = "worker2";
   value.snapshot.agents[1].agent_status = "idle";
+  return JSON.stringify(value);
+}
+function snapshotWithActivity(status = "working") {
+  const value = snapshotWithWorkers(status, "idle");
+  value.snapshot.agents[0].tokens = {
+    pi_activity: JSON.stringify({
+      version: 1, role: "worker", status: "progress", summary: "Reviewing API tests.",
+      currentAction: "Check handler coverage", activeFiles: ["server.go"], changedFiles: [],
+      lastAction: "Read the route implementation", nextAction: "Add a focused test",
+      updatedAt: new Date().toISOString(), activeModel: { provider: "openai-codex", id: "gpt-5.6" },
+      requestedModel: null, modelMatchesRequest: null,
+    }),
+    API_KEY: "do-not-expose",
+  };
   return JSON.stringify(value);
 }
 const success = (stdout = "") => ({ stdout, stderr: "", code: 0, killed: false });
@@ -197,6 +211,11 @@ test("command construction uses fixed Herdr argv and bounds all user-controlled 
     "pane", "read", "w1:p2", "--source", "recent-unwrapped", "--lines", "12", "--format", "text",
   ]);
   assert.deepEqual(buildHerdrCommand("focus", { action: "focus" }, agent).args, ["agent", "focus", "reviewer"]);
+  const sendCommand = buildHerdrCommand("send", { action: "send", message: "Status update only." }, agent);
+  assert.deepEqual(sendCommand.args, ["agent", "prompt", "reviewer", "Status update only."]);
+  assert.equal(sendCommand.timeout, 15_000);
+  assert.equal(sendCommand.replyMarker, undefined);
+  assert.throws(() => buildHerdrCommand("send", { action: "send", message: "bad\0input" }, agent), /NUL/);
   const promptCommand = buildHerdrCommand("prompt", { action: "prompt", prompt: "-- review the patch" }, agent);
   assert.equal(promptCommand.args[0], "agent");
   assert.equal(promptCommand.args[1], "prompt");
@@ -208,12 +227,16 @@ test("command construction uses fixed Herdr argv and bounds all user-controlled 
   assert.deepEqual(promptCommand.args.slice(4), ["--wait", "--timeout", "120000"]);
   assert.equal(promptCommand.args.includes("--"), false);
   assert.equal(promptCommand.timeout, 130_000);
+  const asyncPrompt = buildHerdrCommand("prompt", { action: "prompt", prompt: "inspect", wait_for_replies: false }, agent);
+  assert.deepEqual(asyncPrompt.args.slice(-5), ["--wait", "--until", "working", "--timeout", "5000"]);
+  assert.equal(asyncPrompt.timeout, 10_000);
   assert.deepEqual(buildHerdrCommand("wait", { action: "wait", timeout_ms: 5_000 }, agent).args, [
     "agent", "wait", "reviewer", "--timeout", "5000",
   ]);
   assert.throws(() => buildHerdrCommand("read", { action: "read", lines: 81 }, { paneId: "w1:p2" }), /between 1 and 80/);
   assert.throws(() => buildHerdrCommand("wait", { action: "wait", timeout_ms: 0 }, agent), /between 1000/);
   assert.throws(() => buildHerdrCommand("prompt", { action: "prompt", prompt: "x".repeat(2_401) }, agent), /characters/);
+  assert.throws(() => buildHerdrCommand("prompt", { action: "prompt", prompt: "bad\0input" }, agent), /NUL/);
 });
 
 test("terminal output strips control sequences, redacts environment lines, warns via data, and is capped", () => {
@@ -225,9 +248,13 @@ test("terminal output strips control sequences, redacts environment lines, warns
   const envJson = sanitizeTerminalOutput('{"PATH":"/private","HOME":"/private/home","HERDR_ENV":"1"}');
   assert.match(envJson.text, /suppressed/);
   assert.equal(envJson.environmentRedacted, true);
-  const long = sanitizeTerminalOutput("x".repeat(7_000));
+  const lowercaseEnv = sanitizeTerminalOutput('{"path":"/private","home":"/private/home","access_token":"secret"}');
+  assert.match(lowercaseEnv.text, /suppressed/);
+  assert.doesNotMatch(lowercaseEnv.text, /secret|private/);
+  const long = sanitizeTerminalOutput(`old\n${"x".repeat(7_000)}\nlatest`);
   assert.equal(long.truncated, true);
   assert.ok(long.text.length < 6_100);
+  assert.match(long.text, /latest$/);
 });
 
 test("list uses only the read-only snapshot command and reports sanitized data", async () => {
@@ -247,13 +274,63 @@ test("list uses only the read-only snapshot command and reports sanitized data",
   assert.doesNotMatch(text, /workspace-token-secret|agent-session\.jsonl|agent-token-secret/);
 });
 
+test("activity reads Herdr-reported action and relative files without exposing arbitrary tokens", async () => {
+  const mock = mockedExec([success(snapshotWithActivity())]);
+  const result = await executeHerdrAction({ action: "activity" }, mock.exec, {
+    herdrEnv: "1", currentPaneId: "w9:p9",
+  });
+  const body = JSON.parse(result.content[0].text);
+  assert.equal(body.agents[0].agent, "reviewer");
+  assert.equal(body.agents[0].status, "working");
+  assert.equal(body.agents[0].activity.currentAction, "Check handler coverage");
+  assert.deepEqual(body.agents[0].activity.activeFiles, ["server.go"]);
+  assert.equal(body.agents[0].activityFresh, true);
+  assert.doesNotMatch(result.content[0].text, /do-not-expose|API_KEY/);
+  assert.equal(mock.calls.length, 1);
+});
+
+test("supervisor report publishes bounded activity through Herdr pane metadata", async () => {
+  const mock = mockedExec([success(JSON.stringify(snapshotWithWorkers())), success('{"result":{"type":"pane_updated"}}')]);
+  const result = await executeHerdrAction({
+    action: "report", status: "progress",
+    summary: "Reviewing /Users/me/private. Authorization: Bearer topsecret sk-12345678901234567890 C:/Users/mirin/private.txt",
+    current_action: "Check C:/Users/mirin/repo/server.go", active_files: ["src\\server.go"],
+    files: ["server.go"], last_action: "Read server routes", next_action: "Add a regression test",
+  }, mock.exec, { herdrEnv: "1", currentPaneId: "w1:p1" });
+  assert.equal(result.isError, undefined);
+  const body = JSON.parse(result.content[0].text);
+  assert.equal(body.published, true);
+  assert.equal(body.activity.role, "supervisor");
+  assert.equal(body.activity.summary, "Reviewing [path hidden] Authorization: [credential redacted] [credential redacted] [path hidden]");
+  assert.equal(body.activity.currentAction, "Check [path hidden]");
+  assert.deepEqual(body.activity.activeFiles, ["src/server.go"]);
+  assert.doesNotMatch(result.content[0].text, /Users|mirin|private|topsecret|12345678901234567890/);
+  assert.equal(mock.calls.length, 2);
+  assert.deepEqual(mock.calls[1].args.slice(0, 4), ["pane", "report-metadata", "--source", "pi-herdr-orchestrator-activity"]);
+  assert.equal(mock.calls[1].args.at(-1), "w1:p1");
+  const token = mock.calls[1].args[mock.calls[1].args.indexOf("--token") + 1];
+  const shared = JSON.parse(token.slice("pi_activity=".length));
+  assert.equal(shared.lastAction, "Read server routes");
+  assert.deepEqual(shared.activeFiles, ["src/server.go"]);
+  assert.ok(mock.calls[1].args.includes("900000"));
+
+  const unsafe = mockedExec([success(JSON.stringify(snapshotWithWorkers()))]);
+  const rejected = await executeHerdrAction({
+    action: "report", status: "progress", summary: "Editing.", files: ["../../private.txt"],
+  }, unsafe.exec, { herdrEnv: "1", currentPaneId: "w1:p1" });
+  assert.equal(unsafe.calls.length, 1);
+  assert.equal(rejected.isError, true);
+  assert.match(rejected.content[0].text, /relative, normalized workspace paths/);
+});
+
 test("boss starts one vacant Pi pane and verifies the new long-lived agent", async () => {
-  const mock = mockedExec([success(snapshotJson), success("started"), success(snapshotWithStartedWorker())]);
+  const mock = mockedExec([success(snapshotJson), success("started"), success(snapshotWithStartedWorker()), success('{"result":{"type":"pane_updated"}}')]);
   const result = await executeHerdrAction({ action: "start", target: "w1:p2", name: "worker2", kind: "pi" }, mock.exec, {
     herdrEnv: "1", currentPaneId: "w1:p1", currentModel: { provider: "openai-codex", id: "gpt-5.6" },
   });
-  assert.equal(mock.calls.length, 3);
-  assert.deepEqual(mock.calls[1].args, buildHerdrStartCommand("worker2", "w1:p2").args);
+  assert.equal(mock.calls.length, 4);
+  assert.deepEqual(mock.calls[1].args, buildHerdrStartCommand("worker2", "w1:p2", 30_000, "w1:p1").args);
+  assert.deepEqual(mock.calls[3].args.slice(0, 4), ["pane", "report-metadata", "--source", "pi-herdr-orchestrator-assignment"]);
   const started = JSON.parse(result.content[0].text);
   assert.equal(started.action, "start");
   assert.equal(started.name, "worker2");
@@ -285,6 +362,7 @@ test("boss dispatches unique independent workers in parallel and collects bounde
   const exec = async (command, args, options) => {
     calls.push({ command, args: [...args], options });
     if (args[0] === "api") return success(JSON.stringify(snapshotWithWorkers()));
+    if (args[0] === "pane" && args[1] === "report-metadata") return success('metadata published');
     if (args[0] === "agent" && args[1] === "prompt") return success("accepted");
     if (args[0] === "pane" && args[1] === "read") {
       const target = args[2] === "w1:p1" ? "reviewer" : "tester";
@@ -305,12 +383,13 @@ test("boss dispatches unique independent workers in parallel and collects bounde
     currentPaneId: "w9:p9",
     availableModels: [{ provider: "openai-codex", id: "gpt-5.6" }],
   });
-  assert.equal(calls.length, 5);
+  assert.equal(calls.length, 7);
   assert.equal(calls[0].args[0], "api");
+  assert.equal(calls.filter((call) => call.args[0] === "pane" && call.args[1] === "report-metadata").length, 2);
   const prompts = calls.filter((call) => call.args[0] === "agent" && call.args[1] === "prompt");
   assert.deepEqual(prompts.map((call) => call.args[2]).sort(), ["reviewer", "tester"]);
   assert.equal(prompts.some((call) => call.args[3].includes("select_model")), true);
-  assert.equal(prompts.some((call) => call.args[3].includes("Acceptance criteria")), true);
+  assert.equal(prompts.some((call) => call.args[3].includes("Acceptance:")), true);
   const body = JSON.parse(result.content[0].text);
   assert.equal(body.agents.length, 2);
   assert.deepEqual(body.agents.map((agent) => agent.status), ["replied", "replied"]);
@@ -318,7 +397,7 @@ test("boss dispatches unique independent workers in parallel and collects bounde
   assert.deepEqual(body.agents.map((agent) => agent.reply.includes("reply from")).sort(), [true, true]);
   const modelRequest = body.agents.find((agent) => agent.target === "tester");
   assert.equal(modelRequest.modelRequested, "openai-codex/gpt-5.6");
-  assert.match(modelRequest.modelVerification, /worker-reported/);
+  assert.match(modelRequest.modelVerification, /not verified/);
 });
 
 test("dispatch validates every target before sending and never duplicates a pane", async () => {
@@ -329,7 +408,7 @@ test("dispatch validates every target before sending and never duplicates a pane
       { target: "reviewer", task: "one", acceptance_criteria: "one" },
       { target: "w1:p1", task: "two", acceptance_criteria: "two" },
     ],
-  }, duplicate.exec, { herdrEnv: "1" });
+  }, duplicate.exec, { herdrEnv: "1", currentPaneId: "w9:p9" });
   assert.equal(duplicate.calls.length, 1);
   assert.match(result.content[0].text, /different agent pane/);
 
@@ -337,9 +416,133 @@ test("dispatch validates every target before sending and never duplicates a pane
   const invalid = await executeHerdrAction({
     action: "dispatch",
     assignments: [{ target: "reviewer", task: "one", acceptance_criteria: "one", model_provider: "openai", model_id: "gpt-5.6" }],
-  }, wrongModel.exec, { herdrEnv: "1", availableModels: [{ provider: "openai", id: "gpt-5.6" }] });
+  }, wrongModel.exec, { herdrEnv: "1", currentPaneId: "w9:p9", availableModels: [{ provider: "openai", id: "gpt-5.6" }] });
   assert.equal(wrongModel.calls.length, 1);
   assert.match(invalid.content[0].text, /only for Pi peers/);
+});
+
+test("async dispatch exposes bounded run IDs and collect returns the correlated reply", async () => {
+  const pendingRuns = new Map();
+  const dispatch = mockedExec([
+    success(JSON.stringify(snapshotWithWorkers("idle", "done"))), success("binding published"), success("working"),
+  ]);
+  const started = await executeHerdrAction({
+    action: "dispatch", wait_for_replies: false,
+    assignments: [{
+      target: "tester", task: "Inspect the API test gaps.", acceptance_criteria: "Return one concrete gap or evidence none exist.",
+      model_provider: "openai-codex", model_id: "gpt-5.6",
+    }],
+  }, dispatch.exec, {
+    herdrEnv: "1", currentPaneId: "w9:p9", pendingRuns,
+    availableModels: [{ provider: "openai-codex", id: "gpt-5.6" }],
+  });
+  const startedBody = JSON.parse(started.content[0].text);
+  assert.equal(startedBody.mode, "async");
+  assert.equal(startedBody.agents[0].status, "working_observed");
+  const runId = startedBody.agents[0].run_id;
+  assert.match(runId, /^[a-f0-9-]{36}$/);
+  assert.equal(started.content[0].text.includes([...pendingRuns.values()][0].marker), false);
+  assert.deepEqual(dispatch.calls[1].args.slice(0, 3), ["pane", "report-metadata", "--source"]);
+  assert.ok(dispatch.calls[2].args.includes("--until"));
+
+  const completed = snapshotWithWorkers("done", "done");
+  completed.snapshot.agents[1].tokens = { pi_activity: JSON.stringify({
+    version: 1, role: "worker", status: "done", summary: "Reviewed tests.",
+    currentAction: "Report findings", activeFiles: [], changedFiles: [], lastAction: "Checked assertions",
+    nextAction: null, updatedAt: new Date().toISOString(),
+    requestedModel: { provider: "openai-codex", id: "gpt-5.6" },
+    activeModel: { provider: "openai-codex", id: "gpt-5.6" }, modelMatchesRequest: true,
+  }) };
+  const collect = mockedExec([success(JSON.stringify(completed)), ({ calls }) => {
+    const marker = pendingRuns.get(runId).marker;
+    return success(`${marker}\nAll route branches are tested.\n${marker}`);
+  }]);
+  const result = await executeHerdrAction({ action: "collect", run_id: runId }, collect.exec, {
+    herdrEnv: "1", pendingRuns,
+  });
+  const body = JSON.parse(result.content[0].text);
+  assert.equal(body.status, "replied");
+  assert.equal(body.modelVerification, "verified by worker activity metadata");
+  assert.match(body.reply, /All route branches are tested/);
+  assert.equal(pendingRuns.has(runId), false);
+});
+
+test("collect never verifies a stale or mismatched model report", async () => {
+  for (const activityChanges of [
+    { activeModel: { provider: "anthropic", id: "claude-opus" }, updatedAt: new Date().toISOString() },
+    { activeModel: { provider: "openai-codex", id: "gpt-5.6" }, updatedAt: null },
+  ]) {
+    const createdAt = Date.now();
+    const runId = "12345678-1234-4234-8234-123456789abc";
+    const marker = "HERDR-REPLY-0123456789abcdef-fedcba9876543210";
+    const pendingRuns = new Map([[runId, {
+      runId, marker,
+      target: { cliTarget: "tester", paneId: "w1:p2", agentName: "tester", agentKind: "pi", status: "working" },
+      model: { provider: "openai-codex", id: "gpt-5.6" },
+      createdAt, expiresAt: createdAt + 60_000, submissionConfirmed: true,
+    }]]);
+    const completed = snapshotWithWorkers("done", "done");
+    const updatedAt = activityChanges.updatedAt ?? new Date(createdAt - 5_000).toISOString();
+    completed.snapshot.agents[1].tokens.pi_activity = JSON.stringify({
+      version: 1, role: "worker", status: "done", summary: "Finished.", currentAction: "Report results",
+      activeFiles: [], changedFiles: [], lastAction: "Ran checks", nextAction: null, updatedAt,
+      requestedModel: { provider: "openai-codex", id: "gpt-5.6" },
+      activeModel: activityChanges.activeModel, modelMatchesRequest: true,
+    });
+    const mock = mockedExec([
+      success(JSON.stringify(completed)), success(`${marker}\nFinished the check.\n${marker}`),
+    ]);
+    const result = await executeHerdrAction({ action: "collect", run_id: runId }, mock.exec, {
+      herdrEnv: "1", pendingRuns,
+    });
+    assert.equal(JSON.parse(result.content[0].text).modelVerification, "not verified");
+  }
+});
+
+test("uncertain async submission keeps one run ID for inspection and never resends the prompt", async () => {
+  const pendingRuns = new Map();
+  const calls = [];
+  const exec = async (command, args, options) => {
+    calls.push({ command, args: [...args], options });
+    if (args[0] === "api") return success(JSON.stringify(snapshotWithWorkers("idle", "done")));
+    if (args[0] === "pane" && args[1] === "report-metadata") return success("binding published");
+    throw new Error("agent_prompt_stalled");
+  };
+  const dispatched = await executeHerdrAction({
+    action: "dispatch", wait_for_replies: false,
+    assignments: [{ target: "tester", task: "Inspect the route.", acceptance_criteria: "Return a concrete finding." }],
+  }, exec, { herdrEnv: "1", currentPaneId: "w9:p9", pendingRuns });
+  const runId = JSON.parse(dispatched.content[0].text).agents[0].run_id;
+  assert.equal(JSON.parse(dispatched.content[0].text).agents[0].status, "submission_uncertain");
+  assert.equal(calls.filter((call) => call.args[0] === "agent" && call.args[1] === "prompt").length, 1);
+
+  const collect = mockedExec([success(JSON.stringify(snapshotWithWorkers("idle", "done"))), success("old pane output")]);
+  const inspected = await executeHerdrAction({ action: "collect", run_id: runId }, collect.exec, { herdrEnv: "1", pendingRuns });
+  assert.equal(inspected.isError, true);
+  assert.match(inspected.content[0].text, /no matching reply markers/);
+  assert.equal(collect.calls.some((call) => call.args[0] === "agent" && call.args[1] === "prompt"), false);
+  assert.equal(pendingRuns.has(runId), true);
+});
+
+test("mutations fail closed without caller pane identity; rejected CLI promises remain uncertain and sanitized", async () => {
+  const noIdentity = mockedExec([]);
+  const rejected = await executeHerdrAction({ action: "focus", target: "reviewer" }, noIdentity.exec, { herdrEnv: "1" });
+  assert.equal(noIdentity.calls.length, 0);
+  assert.equal(rejected.isError, true);
+  assert.match(rejected.content[0].text, /pane identity is unavailable/);
+
+  const calls = [];
+  const exec = async (command, args, options) => {
+    calls.push({ command, args, options });
+    if (args[0] === "api") return success(idleSnapshotJson);
+    throw new Error("Bearer topsecret /Users/private/worktree");
+  };
+  const uncertain = await executeHerdrAction({ action: "focus", target: "reviewer" }, exec, {
+    herdrEnv: "1", currentPaneId: "w9:p9",
+  });
+  assert.equal(calls.length, 2);
+  assert.match(uncertain.content[0].text, /whether it completed is unknown.*No retry was attempted/);
+  assert.doesNotMatch(uncertain.content[0].text, /topsecret|private|worktree/);
 });
 
 test("read re-fetches snapshot, selects one pane, and returns bounded sanitized output", async () => {
@@ -363,26 +566,27 @@ test("mutating actions validate a fresh recognized target; prompts wait and retu
     [{ action: "wait", target: "w1:p1", timeout_ms: 3_000 }, snapshotJson, ["agent", "wait", "reviewer", "--timeout", "3000"]],
   ]) {
     const responses = params.action === "prompt"
-      ? [success(snapshot), success('{"result":{"type":"ok"}}'), ({ calls }) => {
+      ? [success(snapshot), success("binding published"), success('{"result":{"type":"ok"}}'), ({ calls }) => {
         const prompt = calls.find((call) => call.args[0] === "agent" && call.args[1] === "prompt").args[3];
         return success(replyForPrompt(prompt, "Concise review: no issues found."));
       }]
       : [success(snapshot), success('{"result":{"type":"ok"}}')];
     const mock = mockedExec(responses);
-    const result = await executeHerdrAction(params, mock.exec, { herdrEnv: "1", cwd: "/repo" });
-    assert.equal(mock.calls.length, params.action === "prompt" ? 3 : 2);
+    const result = await executeHerdrAction(params, mock.exec, { herdrEnv: "1", currentPaneId: "w9:p9", cwd: "/repo" });
+    assert.equal(mock.calls.length, params.action === "prompt" ? 4 : 2);
     assert.deepEqual(mock.calls[0].args, ["api", "snapshot"]);
-    assert.deepEqual(mock.calls[1].args.slice(0, expected.length), expected);
+    const actionCall = mock.calls[params.action === "prompt" ? 2 : 1];
+    assert.deepEqual(actionCall.args.slice(0, expected.length), expected);
     if (params.action === "prompt") {
-      assert.match(mock.calls[1].args[3], /^Request:\nInspect only the selected change/);
-      assert.match(mock.calls[1].args[3], /Reply protocol/);
-      assert.deepEqual(mock.calls[1].args.slice(-3), ["--wait", "--timeout", "120000"]);
+      assert.match(actionCall.args[3], /^Request:\nInspect only the selected change/);
+      assert.match(actionCall.args[3], /Reply protocol/);
+      assert.deepEqual(actionCall.args.slice(-3), ["--wait", "--timeout", "120000"]);
     }
     assert.equal(mock.calls[1].command, "herdr");
     assert.doesNotMatch(JSON.stringify(mock.calls), /bash|sh -c/);
     assert.equal(result.isError, undefined);
     if (params.action === "prompt") {
-      assert.deepEqual(mock.calls[2].args, ["pane", "read", "w1:p1", "--source", "recent-unwrapped", "--lines", "80", "--format", "text"]);
+      assert.deepEqual(mock.calls[3].args, ["pane", "read", "w1:p1", "--source", "recent-unwrapped", "--lines", "80", "--format", "text"]);
       const data = JSON.parse(result.content[0].text);
       assert.equal(data.result, "reply retrieved and correlated");
       assert.match(data.reply, /^HERDR-REPLY-[a-f0-9]{16}-[a-f0-9]{16}\nConcise review: no issues found\.\nHERDR-REPLY-/);
@@ -391,23 +595,81 @@ test("mutating actions validate a fresh recognized target; prompts wait and retu
   }
 });
 
+test("supervisor send submits one message without reply wait, read, or metadata calls", async () => {
+  const mock = mockedExec([success(snapshotJson), success("accepted")]);
+  const result = await executeHerdrAction({ action: "send", target: "reviewer", message: "Please check the build when free." }, mock.exec, {
+    herdrEnv: "1", currentPaneId: "w9:p9",
+  });
+  assert.equal(mock.calls.length, 2);
+  assert.deepEqual(mock.calls[0].args, ["api", "snapshot"]);
+  assert.deepEqual(mock.calls[1].args, ["agent", "prompt", "reviewer", "Please check the build when free."]);
+  const body = JSON.parse(result.content[0].text);
+  assert.equal(body.status, "submitted");
+  assert.equal(body.responseExpected, false);
+  assert.match(body.note, /were not awaited/);
+
+  const uncertain = mockedExec([success(idleSnapshotJson), { stdout: "", stderr: "submission timed out", code: 1, killed: true }]);
+  const timedOut = await executeHerdrAction({ action: "send", target: "reviewer", message: "Check this." }, uncertain.exec, {
+    herdrEnv: "1", currentPaneId: "w9:p9",
+  });
+  assert.equal(uncertain.calls.length, 2);
+  assert.match(timedOut.content[0].text, /whether it completed is unknown.*No retry was attempted/);
+
+  const blocked = mockedExec([success(snapshotWithAgentStatus("blocked"))]);
+  const rejected = await executeHerdrAction({ action: "send", target: "reviewer", message: "Hello" }, blocked.exec, {
+    herdrEnv: "1", currentPaneId: "w9:p9",
+  });
+  assert.equal(blocked.calls.length, 1);
+  assert.match(rejected.content[0].text, /status 'blocked'/);
+});
+
+test("a failed supervisor binding never sends the worker prompt", async () => {
+  const mock = mockedExec([
+    success(idleSnapshotJson),
+    { stdout: "", stderr: "metadata write failed", code: 1, killed: false },
+  ]);
+  const result = await executeHerdrAction({ action: "prompt", target: "reviewer", prompt: "Review this change." }, mock.exec, {
+    herdrEnv: "1", currentPaneId: "w9:p9",
+  });
+  assert.equal(mock.calls.length, 2);
+  assert.equal(mock.calls.some((call) => call.args[0] === "agent" && call.args[1] === "prompt"), false);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /metadata publication may have been applied/);
+  assert.match(result.content[0].text, /No retry was attempted/);
+});
+
 test("stale pane output is not accepted as a correlated reply", async () => {
-  const mock = mockedExec([success(idleSnapshotJson), success("accepted"), success("an old reply without the fresh marker")]);
-  const result = await executeHerdrAction({ action: "prompt", target: "reviewer", prompt: "do the task" }, mock.exec, { herdrEnv: "1" });
-  assert.equal(mock.calls.length, 3);
+  const mock = mockedExec([success(idleSnapshotJson), success("binding published"), success("accepted"), success("an old reply without the fresh marker")]);
+  const result = await executeHerdrAction({ action: "prompt", target: "reviewer", prompt: "do the task" }, mock.exec, { herdrEnv: "1", currentPaneId: "w9:p9" });
+  assert.equal(mock.calls.length, 4);
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /no matching reply markers/);
   assert.match(result.content[0].text, /inspect the pane/);
 });
 
+test("reply correlation happens before output truncation so long fresh replies are not mislabeled stale", async () => {
+  const mock = mockedExec([success(idleSnapshotJson), success("binding published"), success("accepted"), ({ calls }) => {
+    const prompt = calls.find((call) => call.args[0] === "agent" && call.args[1] === "prompt").args[3];
+    return success(replyForPrompt(prompt, `${"analysis ".repeat(18_000)} final finding`));
+  }]);
+  const result = await executeHerdrAction({ action: "prompt", target: "reviewer", prompt: "Review the implementation." }, mock.exec, {
+    herdrEnv: "1", currentPaneId: "w9:p9",
+  });
+  assert.equal(result.isError, undefined);
+  const data = JSON.parse(result.content[0].text);
+  assert.match(data.reply, /final finding/);
+  assert.equal(data.truncated, true);
+});
+
 test("a completed prompt is never resent when retrieving the pane reply fails", async () => {
   const mock = mockedExec([
     success(idleSnapshotJson),
+    success("binding published"),
     success('{"result":{"type":"ok"}}'),
     { stdout: "", stderr: "pane read unavailable", code: 1, killed: false },
   ]);
-  const result = await executeHerdrAction({ action: "prompt", target: "reviewer", prompt: "do the task" }, mock.exec, { herdrEnv: "1" });
-  assert.equal(mock.calls.length, 3);
+  const result = await executeHerdrAction({ action: "prompt", target: "reviewer", prompt: "do the task" }, mock.exec, { herdrEnv: "1", currentPaneId: "w9:p9" });
+  assert.equal(mock.calls.length, 4);
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /accepted the prompt.*reply retrieval failed/i);
   assert.match(result.content[0].text, /Do not resend/);
@@ -431,23 +693,23 @@ test("mutating actions reject the current pane by exact ID and recognized agent 
 
 test("unknown targets, busy agents, and failed prompts are never retried; safe CLI diagnostics are retained", async () => {
   const unknown = mockedExec([success(snapshotJson)]);
-  const rejected = await executeHerdrAction({ action: "focus", target: "missing-agent" }, unknown.exec, { herdrEnv: "1" });
+  const rejected = await executeHerdrAction({ action: "focus", target: "missing-agent" }, unknown.exec, { herdrEnv: "1", currentPaneId: "w9:p9" });
   assert.equal(unknown.calls.length, 1);
   assert.equal(rejected.isError, true);
   assert.match(rejected.content[0].text, /not a recognized agent/i);
 
   const busy = mockedExec([success(snapshotJson)]);
-  const busyResult = await executeHerdrAction({ action: "prompt", target: "reviewer", prompt: "do the task" }, busy.exec, { herdrEnv: "1" });
+  const busyResult = await executeHerdrAction({ action: "prompt", target: "reviewer", prompt: "do the task" }, busy.exec, { herdrEnv: "1", currentPaneId: "w9:p9" });
   assert.equal(busy.calls.length, 1);
   assert.equal(busyResult.isError, true);
   assert.match(busyResult.content[0].text, /status 'working'/);
 
-  const failed = mockedExec([success(idleSnapshotJson), {
+  const failed = mockedExec([success(idleSnapshotJson), success("binding published"), {
     stdout: "", stderr: "agent_blocked: prompt was rejected\nAPI_KEY=secret\n/Users/mirin/private.txt",
     code: 1, killed: false,
   }]);
-  const failedPrompt = await executeHerdrAction({ action: "prompt", target: "reviewer", prompt: "do the task" }, failed.exec, { herdrEnv: "1" });
-  assert.equal(failed.calls.length, 2);
+  const failedPrompt = await executeHerdrAction({ action: "prompt", target: "reviewer", prompt: "do the task" }, failed.exec, { herdrEnv: "1", currentPaneId: "w9:p9" });
+  assert.equal(failed.calls.length, 3);
   assert.equal(failedPrompt.isError, true);
   assert.match(failedPrompt.content[0].text, /agent_blocked/);
   assert.match(failedPrompt.content[0].text, /whether it completed is unknown/);
@@ -456,9 +718,9 @@ test("unknown targets, busy agents, and failed prompts are never retried; safe C
     assert.equal(failedPrompt.content[0].text.includes(secret), false, `CLI diagnostic leaked ${secret}`);
   }
 
-  const timedOut = mockedExec([success(idleSnapshotJson), { stdout: "", stderr: "API_KEY=private details", code: 1, killed: true }]);
-  const ambiguous = await executeHerdrAction({ action: "prompt", target: "reviewer", prompt: "do the task" }, timedOut.exec, { herdrEnv: "1" });
-  assert.equal(timedOut.calls.length, 2);
+  const timedOut = mockedExec([success(idleSnapshotJson), success("binding published"), { stdout: "", stderr: "API_KEY=private details", code: 1, killed: true }]);
+  const ambiguous = await executeHerdrAction({ action: "prompt", target: "reviewer", prompt: "do the task" }, timedOut.exec, { herdrEnv: "1", currentPaneId: "w9:p9" });
+  assert.equal(timedOut.calls.length, 3);
   assert.equal(ambiguous.isError, true);
   assert.match(ambiguous.content[0].text, /unknown.*No retry was attempted/i);
   assert.doesNotMatch(ambiguous.content[0].text, /private details/);
@@ -472,6 +734,7 @@ test("extension registers exactly one tool only in Herdr and explains a missing 
 
   withHerdrEnv("1", () => herdrOrchestrator(pi));
   assert.deepEqual(tools.map((tool) => tool.name), ["herdr_swarm"]);
+  assert.match(tools[0].description, /Send one-way messages without waiting/);
   const mock = mockedExec([]);
   const unavailable = await withHerdrEnv(undefined, () => tools[0].execute("call", { action: "list" }, undefined, undefined, {
     cwd: "/repo",
